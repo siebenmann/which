@@ -3,6 +3,7 @@ package which
 import (
 	"debug/gosym"
 	"errors"
+	"go/build"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -115,8 +116,40 @@ func NewExec(path string) (*Exec, error) {
 
 // Import gives the import path of main package of given executable. It returns
 // non-nil error when it fails to guess the exact path.
+//
+// TODO(cks): support Go modules somehow, since they may not be built
+// in directory trees that we can understand to extract a package name
+// from.
+//
+// rsc.io/goversion/version can extract module information from binaries
+// that contain it, and runtime/debug.ReadBuildInfo extracts it from
+// the current program, but there doesn't seem to be an official
+// interface for getting it from files. The module info is also
+// apparently stored purely as a string, and would have to be parsed
+// into the runtime/debug.BuildInfo form. Summary: it would be
+// fragile.
 func (ex *Exec) Import() (string, error) {
 	var dirs = make(map[string]struct{})
+	name := filepath.Base(ex.Path)
+	if ex.Type == PlatformWindows386 || ex.Type == PlatformWindowsAMD64 {
+		name = strings.TrimSuffix(name, ".exe")
+	}
+
+	// All executables should have a main.main function, which
+	// should have line number information, which should reliably
+	// give us the file that main.main comes from.
+	mainfn := ex.table.LookupFunc("main.main")
+	if mainfn == nil {
+		// If there is no main.main our heuristic code will fail
+		// too, so we give up now.
+		return "", ErrGuessFail
+	}
+	if file, _, fn := ex.table.PCToLine(mainfn.Entry); fn != nil {
+		return genpkgpath(name, filepath.Dir(file))
+	}
+
+	// If obtaining the line number information fails for some
+	// reason we fall back to the original heuristics.
 	for file, obj := range ex.table.Files {
 		for i := range obj.Funcs {
 			// main.main symbol is referenced by every file of each package
@@ -125,10 +158,6 @@ func (ex *Exec) Import() (string, error) {
 				dirs[filepath.Dir(file)] = struct{}{}
 			}
 		}
-	}
-	name := filepath.Base(ex.Path)
-	if ex.Type == PlatformWindows386 || ex.Type == PlatformWindowsAMD64 {
-		name = strings.TrimRight(name, ".exe")
 	}
 	if pkg, unique := guesspkg(name, dirs); unique && pkg != "" {
 		return pkg, nil
@@ -209,4 +238,61 @@ func guesspkg(name string, dirs map[string]struct{}) (pkg string, unique bool) {
 		}
 	}
 	return
+}
+
+// getgopath gets a slice of directories that are GOPATH.
+// $GOPATH can be a colon-separated list of paths, so we must cope.
+// This requires Go 1.8+ for go/build's Default.GOPATH.
+func getgopath() []string {
+	gopath := os.Getenv("GOPATH")
+	if gopath == "" {
+		gopath = build.Default.GOPATH
+	}
+	return strings.Split(gopath, ":")
+}
+
+// genpkgpath generates the package path from a raw directory,
+// attempting to determine if it's under either GOROOT or GOPATH.
+// If the path does not appear to be under either, we return it
+// untouched as the best we can do. To deal with various issues,
+// we attempt to canonicalize all symlinks, because built programs
+// generally embed the non-symlink path even if $GOPATH or $HOME
+// involves a symlink.
+func genpkgpath(name, dir string) (string, error) {
+	var checkpaths []string
+	checkpaths = []string{runtime.GOROOT()}
+	checkpaths = append(checkpaths, getgopath()...)
+
+	if nd, err := filepath.EvalSymlinks(dir); err == nil {
+		dir = nd
+	}
+	for _, path := range checkpaths {
+		if abs, err := filepath.EvalSymlinks(path); err == nil {
+			path = abs
+		}
+		pth := path + string(os.PathSeparator)
+		if strings.HasPrefix(dir, pth) {
+			// We must subtract one because we add a slash
+			// to both the end of the path and to the
+			// start of src.
+			return dir[len(pth)+len(src)-1:], nil
+		}
+	}
+
+	// If we failed to find anything, we fall back to guesspkg
+	// in the hopes that it works. This is okay because what we
+	// care about here is the *package name*, not the $GOPATH
+	// location.
+	pkg, unique := guesspkg(name, map[string]struct{}{
+		dir: struct{}{},
+	})
+	if unique {
+		return pkg, nil
+	}
+
+	// At this point we can't determine the package name (what we
+	// have is only a directory name), so we must return an error.
+	// This could happen if, for example, the binary is the result
+	// of building a module-based package in a directory.
+	return "", ErrGuessFail
 }
