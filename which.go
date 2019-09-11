@@ -118,8 +118,8 @@ func NewExec(path string) (*Exec, error) {
 // non-nil error when it fails to guess the exact path.
 //
 // TODO(cks): support Go modules somehow, since they may not be built
-// in directory trees that we can understand to extract a package name
-// from.
+// in local directory trees that we can understand to extract a
+// package name from.
 //
 // rsc.io/goversion/version can extract module information from binaries
 // that contain it, and runtime/debug.ReadBuildInfo extracts it from
@@ -251,6 +251,44 @@ func getgopath() []string {
 	return strings.Split(gopath, ":")
 }
 
+// pathtomodule transforms directory paths from underneath
+// $GOPATH/pkg/mod/ (with that prefix removed) into package names
+// including the module version (the package name may also be the
+// module name, but not necessarily; it may be a sub-package within
+// the module, such as '.../cmd/program'). There are two cases. A
+// program built directly in the module top level has a directory name
+// like:
+//	a.b/x/fred@v....
+// This can be used straight.
+// A program built in a subdirectory has a directory name like:
+//	a.b/x/fred@v.../cmd/program
+//
+// We must move the '@...' part to the end.
+//
+// Including the module version in the result is arguable but useful.
+// It can be handed to 'go get' to reproduce the binary and it is part
+// of the module specification for how the binary was built. It's also
+// the only way to make it clear that this was a pure module build,
+// one made without a local source tree.
+func pathtomodule(dir string) string {
+	ati := strings.LastIndexByte(dir, '@')
+	// This shouldn't happen but whatever.
+	if ati == -1 {
+		return dir
+	}
+	versuf := dir[ati:]
+	tdir := strings.IndexRune(versuf, os.PathSeparator)
+	if tdir == -1 {
+		return dir
+	}
+	// We can't .Join() all three components because there can't
+	// be a '/' between the last portion of the directory name and
+	// the version, ie it's not '.../cmd/program/@v...'.
+	return filepath.Join(dir[:ati], versuf[tdir:]) + versuf[:tdir]
+}
+
+var mod = filepath.FromSlash("/pkg/mod/")
+
 // genpkgpath generates the package path from a raw directory,
 // attempting to determine if it's under either GOROOT or GOPATH.
 // If the path does not appear to be under either, we return it
@@ -271,11 +309,27 @@ func genpkgpath(name, dir string) (string, error) {
 			path = abs
 		}
 		pth := path + string(os.PathSeparator)
-		if strings.HasPrefix(dir, pth) {
-			// We must subtract one because we add a slash
-			// to both the end of the path and to the
-			// start of src.
-			return dir[len(pth)+len(src)-1:], nil
+		if !strings.HasPrefix(dir, pth) {
+			continue
+		}
+		// First, look for a straightforward build, which has
+		// a directory name under $GOPATH/src/. This may be a
+		// non-module build or a module build; we can't
+		// actually tell from the directory path
+		// alone. However in either case it's been built
+		// directly from the source code there.
+		spth := pth + "src" + string(os.PathSeparator)
+		if strings.HasPrefix(dir, spth) {
+			return dir[len(spth):], nil
+		}
+		// Second, look for a module build that was done
+		// directly through 'go get <something>@<version>',
+		// which has a directory name under $GOPATH/pkg/mod/.
+		// In this case we report the package name with the
+		// module version.
+		mpth := filepath.Join(pth, "pkg", "mod") + string(os.PathSeparator)
+		if strings.HasPrefix(dir, mpth) {
+			return pathtomodule(dir[len(mpth):]), nil
 		}
 	}
 
@@ -288,6 +342,13 @@ func genpkgpath(name, dir string) (string, error) {
 	})
 	if unique {
 		return pkg, nil
+	}
+
+	// Special hack for a direct module build using a different
+	// $GOPATH than our current one, which we detect by looking
+	// for '/pkg/mod/' in the directory path.
+	if i := strings.LastIndex(dir, mod); i != -1 {
+		return pathtomodule(dir[i+len(mod):]), nil
 	}
 
 	// At this point we can't determine the package name (what we
